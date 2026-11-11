@@ -38,7 +38,7 @@ if (!scanColumns.has('last_ingest_ms')) db.exec('ALTER TABLE scan_status ADD COL
 const flipColumns = new Set(db.prepare('PRAGMA table_info(flips)').all().map(column => column.name));
 for (const [name, type] of [['spend_silver', 'INTEGER'], ['profit_silver', 'INTEGER'],
   ['max_quantity', 'INTEGER'],
-  ['quantity_completed', 'INTEGER'], ['outcome_at', 'TEXT']]) {
+  ['quantity_completed', 'INTEGER'], ['outcome_at', 'TEXT'], ['archived', 'INTEGER NOT NULL DEFAULT 0']]) {
   if (!flipColumns.has(name)) db.exec(`ALTER TABLE flips ADD COLUMN ${name} ${type}`);
 }
 function clearStaleOrders() {
@@ -60,6 +60,7 @@ clearStaleOrders();
 const staleCleanupTimer = setInterval(clearStaleOrders, 60 * 1000);
 staleCleanupTimer.unref();
 app.use(express.json({ limit: '20mb' }));
+app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 app.use(express.static(path.join(__dirname, 'public')));
 
 const upsertOrder = db.prepare(`INSERT INTO orders
@@ -126,7 +127,7 @@ app.get('/api/flips', (_req, res) => {
   const tax = reqTax(_req.query.premium);
   const orders = db.prepare('SELECT * FROM orders').all();
   const map = new Map(orders.map(o => [o.id, o]));
-  const flips = db.prepare("SELECT * FROM flips WHERE status IN ('active','done','failed')").all();
+  const flips = db.prepare("SELECT * FROM flips WHERE archived=0 AND status IN ('active','done','failed')").all();
   res.json(flips.map(f => presentFlip(f, map, tax)));
 });
 
@@ -244,6 +245,10 @@ app.patch('/api/flips/:id', (req, res) => {
 app.delete('/api/flips/:id', (req, res) => {
   db.prepare("DELETE FROM flips WHERE id=? AND status='active'").run(Number(req.params.id));
   res.sendStatus(204);
+});
+app.post('/api/flips/archive-recorded', (_req, res) => {
+  const result = db.prepare("UPDATE flips SET archived=1 WHERE archived=0 AND status IN ('done','failed')").run();
+  res.json({ archived:result.changes });
 });
 
 const server = app.listen(PORT, HOST, () => console.log(`Listening on http://${HOST}:${PORT}`));
