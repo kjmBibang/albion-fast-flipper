@@ -38,7 +38,7 @@ if (!scanColumns.has('last_ingest_ms')) db.exec('ALTER TABLE scan_status ADD COL
 const flipColumns = new Set(db.prepare('PRAGMA table_info(flips)').all().map(column => column.name));
 for (const [name, type] of [['spend_silver', 'INTEGER'], ['profit_silver', 'INTEGER'],
   ['max_quantity', 'INTEGER'],
-  ['quantity_completed', 'INTEGER'], ['outcome_at', 'TEXT']]) {
+  ['quantity_completed', 'INTEGER'], ['outcome_at', 'TEXT'], ['archived', 'INTEGER NOT NULL DEFAULT 0']]) {
   if (!flipColumns.has(name)) db.exec(`ALTER TABLE flips ADD COLUMN ${name} ${type}`);
 }
 function clearStaleOrders() {
@@ -46,9 +46,15 @@ function clearStaleOrders() {
   db.exec('BEGIN');
   try {
     db.prepare(`DELETE FROM flips WHERE status='active' AND
-      (buy_order_id IN (SELECT id FROM orders WHERE last_seen < ?) OR
-       sell_order_id IN (SELECT id FROM orders WHERE last_seen < ?))`).run(cutoff, cutoff);
-    const result = db.prepare('DELETE FROM orders WHERE last_seen < ?').run(cutoff);
+      buy_order_id IN (SELECT id FROM orders WHERE last_seen < ?) AND
+      sell_order_id IN (SELECT id FROM orders WHERE last_seen < ?)` ).run(cutoff, cutoff);
+    const result = db.prepare(`DELETE FROM orders WHERE last_seen < ? AND id NOT IN (
+      SELECT f.buy_order_id FROM flips f JOIN orders other ON other.id=f.sell_order_id
+      WHERE f.status='active' AND other.last_seen >= ?
+      UNION
+      SELECT f.sell_order_id FROM flips f JOIN orders other ON other.id=f.buy_order_id
+      WHERE f.status='active' AND other.last_seen >= ?
+    )`).run(cutoff, cutoff, cutoff);
     db.exec('COMMIT');
     if (result.changes) console.log(`Cleared ${result.changes} market orders not seen in the last 30 minutes`);
   } catch (err) {
@@ -60,6 +66,7 @@ clearStaleOrders();
 const staleCleanupTimer = setInterval(clearStaleOrders, 60 * 1000);
 staleCleanupTimer.unref();
 app.use(express.json({ limit: '20mb' }));
+app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 app.use(express.static(path.join(__dirname, 'public')));
 
 const upsertOrder = db.prepare(`INSERT INTO orders
@@ -126,7 +133,7 @@ app.get('/api/flips', (_req, res) => {
   const tax = reqTax(_req.query.premium);
   const orders = db.prepare('SELECT * FROM orders').all();
   const map = new Map(orders.map(o => [o.id, o]));
-  const flips = db.prepare("SELECT * FROM flips WHERE status IN ('active','done','failed')").all();
+  const flips = db.prepare("SELECT * FROM flips WHERE archived=0 AND status IN ('active','done','failed')").all();
   res.json(flips.map(f => presentFlip(f, map, tax)));
 });
 
@@ -166,12 +173,46 @@ function presentFlip(f, orderMap, taxRate = f.tax_rate) {
   const cost = source ? (f.quantity_completed ?? matchedQuantity) * Number(source.unit_price) : 0;
   const proceeds = buy ? (f.quantity_completed ?? matchedQuantity) * Number(buy.unit_price) : 0;
   const profit = f.profit_silver ?? (Math.floor(proceeds * (1 - taxRate)) - cost);
-  const ages = live ? [Date.now() - Date.parse(buy.first_seen), Date.now() - Date.parse(source.first_seen)] : [];
+  const ages = buy && source ? [Date.now() - Date.parse(buy.last_seen), Date.now() - Date.parse(source.last_seen)] : [];
   return { id:f.id, status:f.status, buyOrder:buy || null, sourceOrder:source || null, quantity, matchedQuantity,
     taxRate, estimatedProfitSilver:profit, spendSilver:f.spend_silver ?? cost, outcomeAt:f.outcome_at,
     unitProfitSilver: quantity && buy && source ? Math.floor(Number(buy.unit_price)*(1-taxRate))-Number(source.unit_price) : 0,
     buyAgeMs:ages[0] || 0, sourceAgeMs:ages[1] || 0, oldestAgeMs:Math.max(...ages, 0), live };
 }
+
+const itemNameCache = new Map();
+const itemNameRequests = new Map();
+async function fetchItemName(id) {
+  if (itemNameCache.has(id)) return itemNameCache.get(id);
+  if (itemNameRequests.has(id)) return itemNameRequests.get(id);
+  const request = (async () => {
+    try {
+      const url = `https://gameinfo.albiononline.com/api/gameinfo/items/${encodeURIComponent(id)}`;
+      let response = await fetch(url, { signal:AbortSignal.timeout(5000) });
+      if (!response.ok) response = await fetch(`${url}/data`, { signal:AbortSignal.timeout(5000) });
+      if (!response.ok) return null;
+      const item = await response.json();
+      const names = item.LocalizedNames || {};
+      const name = names['EN-US'] || names['en-US'] || item.Name || null;
+      if (name) itemNameCache.set(id, name);
+      return name;
+    } catch { return null; }
+    finally { itemNameRequests.delete(id); }
+  })();
+  itemNameRequests.set(id, request);
+  return request;
+}
+app.get('/api/item-names', async (req, res) => {
+  const ids = [...new Set(String(req.query.ids || '').split(',')
+    .filter(id => /^[A-Z0-9_@]+$/.test(id)))].slice(0, 80);
+  const names = {};
+  for (let start=0; start<ids.length; start+=8) {
+    const batch = ids.slice(start, start+8);
+    const results = await Promise.all(batch.map(id => fetchItemName(id)));
+    batch.forEach((id, index) => { if (results[index]) names[id] = results[index]; });
+  }
+  res.json(names);
+});
 
 app.get('/api/candidates', (req, res) => {
   const tax = reqTax(req.query.premium);
@@ -185,7 +226,7 @@ app.get('/api/candidates', (req, res) => {
     sourcesByItem.get(item).push(source);
   }
   const ignored = new Set(db.prepare("SELECT buy_order_id, sell_order_id FROM flips WHERE status IN ('active','done','failed')").all()
-    .map(x => `${Sx.buy_order_id}:${x.sell_order_id}`));
+    .map(x => `${x.buy_order_id}:${x.sell_order_id}`));
   const matches = [];
   for (const buy of bmBuys) for (const source of (sourcesByItem.get(itemKey(buy)) || [])) {
     const key = `${buy.id}:${source.id}`;
@@ -194,8 +235,8 @@ app.get('/api/candidates', (req, res) => {
     const profit = Math.floor(quantity * Number(buy.unit_price) * (1-tax)) - quantity * Number(source.unit_price);
     if (quantity > 0 && profit > 0) matches.push({ buyOrder:buy, sourceOrder:source, quantity:Number(buy.amount), matchedQuantity:quantity,
       taxRate:tax, estimatedProfitSilver:profit, unitProfitSilver:Math.floor(Number(buy.unit_price)*(1-tax))-Number(source.unit_price),
-      buyAgeMs:Date.now()-Date.parse(buy.first_seen), sourceAgeMs:Date.now()-Date.parse(source.first_seen),
-      oldestAgeMs:Math.max(Date.now()-Date.parse(buy.first_seen),Date.now()-Date.parse(source.first_seen)) });
+      buyAgeMs:Date.now()-Date.parse(buy.last_seen), sourceAgeMs:Date.now()-Date.parse(source.last_seen),
+      oldestAgeMs:Math.max(Date.now()-Date.parse(buy.last_seen),Date.now()-Date.parse(source.last_seen)) });
   }
   res.json(matches.sort((a,b)=>b.estimatedProfitSilver-a.estimatedProfitSilver));
 });
@@ -244,6 +285,10 @@ app.patch('/api/flips/:id', (req, res) => {
 app.delete('/api/flips/:id', (req, res) => {
   db.prepare("DELETE FROM flips WHERE id=? AND status='active'").run(Number(req.params.id));
   res.sendStatus(204);
+});
+app.post('/api/flips/archive-recorded', (_req, res) => {
+  const result = db.prepare("UPDATE flips SET archived=1 WHERE archived=0 AND status IN ('done','failed')").run();
+  res.json({ archived:result.changes });
 });
 
 const server = app.listen(PORT, HOST, () => console.log(`Listening on http://${HOST}:${PORT}`));
