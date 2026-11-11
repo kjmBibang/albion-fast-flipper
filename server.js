@@ -161,12 +161,13 @@ function presentFlip(f, orderMap, taxRate = f.tax_rate) {
   const buy = orderMap.get(f.buy_order_id);
   const source = orderMap.get(f.sell_order_id);
   const live = isLive(buy) && isLive(source);
-  const quantity = f.quantity_completed ?? (live ? Math.min(Number(buy.amount), Number(source.amount)) : 0);
-  const cost = source ? quantity * Number(source.unit_price) : 0;
-  const proceeds = buy ? quantity * Number(buy.unit_price) : 0;
+  const matchedQuantity = live ? Math.min(Number(buy.amount), Number(source.amount)) : 0;
+  const quantity = f.quantity_completed ?? (buy ? Number(buy.amount) : 0);
+  const cost = source ? (f.quantity_completed ?? matchedQuantity) * Number(source.unit_price) : 0;
+  const proceeds = buy ? (f.quantity_completed ?? matchedQuantity) * Number(buy.unit_price) : 0;
   const profit = f.profit_silver ?? (Math.floor(proceeds * (1 - taxRate)) - cost);
   const ages = live ? [Date.now() - Date.parse(buy.first_seen), Date.now() - Date.parse(source.first_seen)] : [];
-  return { id:f.id, status:f.status, buyOrder:buy || null, sourceOrder:source || null, quantity,
+  return { id:f.id, status:f.status, buyOrder:buy || null, sourceOrder:source || null, quantity, matchedQuantity,
     taxRate, estimatedProfitSilver:profit, spendSilver:f.spend_silver ?? cost, outcomeAt:f.outcome_at,
     unitProfitSilver: quantity && buy && source ? Math.floor(Number(buy.unit_price)*(1-taxRate))-Number(source.unit_price) : 0,
     buyAgeMs:ages[0] || 0, sourceAgeMs:ages[1] || 0, oldestAgeMs:Math.max(...ages, 0), live };
@@ -191,7 +192,7 @@ app.get('/api/candidates', (req, res) => {
     if (ignored.has(key)) continue;
     const quantity = Math.min(Number(buy.amount), Number(source.amount));
     const profit = Math.floor(quantity * Number(buy.unit_price) * (1-tax)) - quantity * Number(source.unit_price);
-    if (quantity > 0 && profit > 0) matches.push({ buyOrder:buy, sourceOrder:source, quantity,
+    if (quantity > 0 && profit > 0) matches.push({ buyOrder:buy, sourceOrder:source, quantity:Number(buy.amount), matchedQuantity:quantity,
       taxRate:tax, estimatedProfitSilver:profit, unitProfitSilver:Math.floor(Number(buy.unit_price)*(1-tax))-Number(source.unit_price),
       buyAgeMs:Date.now()-Date.parse(buy.first_seen), sourceAgeMs:Date.now()-Date.parse(source.first_seen),
       oldestAgeMs:Math.max(Date.now()-Date.parse(buy.first_seen),Date.now()-Date.parse(source.first_seen)) });
@@ -224,9 +225,11 @@ app.patch('/api/flips/:id', (req, res) => {
   const source = db.prepare('SELECT * FROM orders WHERE id=?').get(flip.sell_order_id);
   if (!buy || !source) return res.status(409).json({ error:'Order details are unavailable; outcome was not recorded.' });
   const maxQuantity = Number(flip.max_quantity) || Math.min(Number(buy.amount), Number(source.amount));
+  // The saved opportunity is only a market snapshot. A completed trade can
+  // include more items than either order showed at scan time.
   const quantity = req.body?.quantity == null ? maxQuantity : Number(req.body.quantity);
-  if (!Number.isInteger(quantity) || quantity < 1 || quantity > maxQuantity)
-    return res.status(400).json({ error:`Enter a whole quantity from 1 to ${maxQuantity}.` });
+  if (!Number.isSafeInteger(quantity) || quantity < 1)
+    return res.status(400).json({ error:'Enter a whole quantity greater than zero.' });
   const spend = quantity * Number(source.unit_price);
   const targetSaleValue = quantity * Number(buy.unit_price);
   const saleTax = status === 'failed' ? 0.025 : flip.tax_rate;
