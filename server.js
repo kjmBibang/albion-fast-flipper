@@ -6,6 +6,7 @@ const { DatabaseSync } = require('node:sqlite');
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '127.0.0.1';
+const STALE_ORDER_MS = 60 * 60 * 1000;
 const SAMPLES_DIR = path.join(__dirname, 'samples');
 const db = new DatabaseSync(path.join(__dirname, 'albion-flipper.sqlite'));
 fs.mkdirSync(SAMPLES_DIR, { recursive: true });
@@ -29,6 +30,7 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS orders_match_idx
     ON orders(location_id, auction_type, item_type, quality, enchantment);
+  CREATE INDEX IF NOT EXISTS orders_last_seen_idx ON orders(last_seen);
 `);
 db.prepare('INSERT OR IGNORE INTO scan_status (id) VALUES (1)').run();
 const scanColumns = new Set(db.prepare('PRAGMA table_info(scan_status)').all().map(column => column.name));
@@ -39,6 +41,24 @@ for (const [name, type] of [['spend_silver', 'INTEGER'], ['profit_silver', 'INTE
   ['quantity_completed', 'INTEGER'], ['outcome_at', 'TEXT']]) {
   if (!flipColumns.has(name)) db.exec(`ALTER TABLE flips ADD COLUMN ${name} ${type}`);
 }
+function clearStaleOrders() {
+  const cutoff = new Date(Date.now() - STALE_ORDER_MS).toISOString();
+  db.exec('BEGIN');
+  try {
+    db.prepare(`DELETE FROM flips WHERE status='active' AND
+      (buy_order_id IN (SELECT id FROM orders WHERE last_seen < ?) OR
+       sell_order_id IN (SELECT id FROM orders WHERE last_seen < ?))`).run(cutoff, cutoff);
+    const result = db.prepare('DELETE FROM orders WHERE last_seen < ?').run(cutoff);
+    db.exec('COMMIT');
+    if (result.changes) console.log(`Cleared ${result.changes} market orders not seen in the last hour`);
+  } catch (err) {
+    db.exec('ROLLBACK');
+    console.error('Could not clear stale market orders:', err.message);
+  }
+}
+clearStaleOrders();
+const staleCleanupTimer = setInterval(clearStaleOrders, 60 * 1000);
+staleCleanupTimer.unref();
 app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -87,14 +107,20 @@ app.post('/marketorders.ingest', (req, res) => {
 });
 
 app.get('/api/scan-status', (_req, res) => {
+  const now = new Date().toISOString();
+  const cutoff = new Date(Date.now() - STALE_ORDER_MS).toISOString();
   const status = db.prepare(`SELECT last_received_at, last_batch_count, total_batches, total_received, last_ingest_ms,
-    (SELECT COUNT(*) FROM orders) AS unique_order_count,
-    (SELECT COUNT(*) FROM orders WHERE expires='' OR expires>?) AS live_order_count
-    FROM scan_status WHERE id=1`).get(new Date().toISOString());
+    (SELECT COUNT(*) FROM orders WHERE last_seen>=?) AS unique_order_count,
+    (SELECT COUNT(*) FROM orders WHERE last_seen>=? AND (expires='' OR expires>?)) AS live_order_count
+    FROM scan_status WHERE id=1`).get(cutoff, cutoff, now);
   res.json(status);
 });
 
-app.get('/api/orders', (_req, res) => res.json(db.prepare('SELECT * FROM orders').all()));
+app.get('/api/orders', (_req, res) => {
+  const cutoff = new Date(Date.now() - STALE_ORDER_MS).toISOString();
+  const now = new Date().toISOString();
+  res.json(db.prepare("SELECT * FROM orders WHERE last_seen>=? AND (expires='' OR expires>?)").all(cutoff, now));
+});
 
 app.get('/api/flips', (_req, res) => {
   const tax = reqTax(_req.query.premium);
@@ -121,7 +147,12 @@ app.get('/api/performance', (_req, res) => {
 
 function reqTax(premium) { return premium === 'true' ? 0.04 : 0.08; }
 function itemKey(o) { return `${o.item_type}\u0000${Number(o.quality)}\u0000${Number(o.enchantment)}`; }
-function isLive(o) { return o && (!o.expires || Date.parse(o.expires) > Date.now()); }
+function isLive(o) {
+  if (!o) return false;
+  const seenAt = Date.parse(o.last_seen);
+  return Number.isFinite(seenAt) && Date.now() - seenAt <= STALE_ORDER_MS &&
+    (!o.expires || Date.parse(o.expires) > Date.now());
+}
 function sameItem(a, b) {
   return a.item_type === b.item_type && Number(a.quality) === Number(b.quality) &&
     Number(a.enchantment) === Number(b.enchantment);
@@ -131,13 +162,13 @@ function presentFlip(f, orderMap, taxRate = f.tax_rate) {
   const source = orderMap.get(f.sell_order_id);
   const live = isLive(buy) && isLive(source);
   const quantity = f.quantity_completed ?? (live ? Math.min(Number(buy.amount), Number(source.amount)) : 0);
-  const cost = quantity * Number(source.unit_price);
-  const proceeds = quantity * Number(buy.unit_price);
+  const cost = source ? quantity * Number(source.unit_price) : 0;
+  const proceeds = buy ? quantity * Number(buy.unit_price) : 0;
   const profit = f.profit_silver ?? (Math.floor(proceeds * (1 - taxRate)) - cost);
   const ages = live ? [Date.now() - Date.parse(buy.first_seen), Date.now() - Date.parse(source.first_seen)] : [];
-  return { id:f.id, status:f.status, buyOrder:buy, sourceOrder:source, quantity,
+  return { id:f.id, status:f.status, buyOrder:buy || null, sourceOrder:source || null, quantity,
     taxRate, estimatedProfitSilver:profit, spendSilver:f.spend_silver ?? cost, outcomeAt:f.outcome_at,
-    unitProfitSilver: quantity ? Math.floor(Number(buy.unit_price)*(1-taxRate))-Number(source.unit_price) : 0,
+    unitProfitSilver: quantity && buy && source ? Math.floor(Number(buy.unit_price)*(1-taxRate))-Number(source.unit_price) : 0,
     buyAgeMs:ages[0] || 0, sourceAgeMs:ages[1] || 0, oldestAgeMs:Math.max(...ages, 0), live };
 }
 
