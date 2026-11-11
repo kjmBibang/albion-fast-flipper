@@ -3,4 +3,5 @@ Uses [Albion Online Data Project(AODP) client](https://github.com/ao-data/albion
 
 
  redirect AODP data:
- & "C:\Program Files\Albion Data Client\albiondata-client.exe" -i "http://127.0.0.1:3000,http+pow://pow.east.albion-online-data.com"
+ & "C:\Program Files\Albion Data Client\albiondata-client.exe" -i "http://127.0.0.1:3000,http+pow://pow.east.albion-online-data.com" OR
+ "C:\Program Files\Albion Data Client\albiondata-client.exe" -i http://localhost:3000
