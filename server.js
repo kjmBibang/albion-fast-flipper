@@ -6,7 +6,7 @@ const { DatabaseSync } = require('node:sqlite');
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '127.0.0.1';
-const STALE_ORDER_MS = 60 * 60 * 1000;
+const STALE_ORDER_MS = 30 * 60 * 1000;
 const SAMPLES_DIR = path.join(__dirname, 'samples');
 const db = new DatabaseSync(path.join(__dirname, 'albion-flipper.sqlite'));
 fs.mkdirSync(SAMPLES_DIR, { recursive: true });
@@ -50,7 +50,7 @@ function clearStaleOrders() {
        sell_order_id IN (SELECT id FROM orders WHERE last_seen < ?))`).run(cutoff, cutoff);
     const result = db.prepare('DELETE FROM orders WHERE last_seen < ?').run(cutoff);
     db.exec('COMMIT');
-    if (result.changes) console.log(`Cleared ${result.changes} market orders not seen in the last hour`);
+    if (result.changes) console.log(`Cleared ${result.changes} market orders not seen in the last 30 minutes`);
   } catch (err) {
     db.exec('ROLLBACK');
     console.error('Could not clear stale market orders:', err.message);
