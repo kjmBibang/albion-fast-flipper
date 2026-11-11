@@ -174,7 +174,18 @@ function stonesPerEnchant(itemType) {
   return 0;
 }
 const STONE_BY_STEP = ['RUNE', 'SOUL', 'RELIC'];
-function materialPlanFor(source, targetEnchant, quantity, orders) {
+function indexMaterialOffers(orders) {
+  const index=new Map();
+  for(const order of orders){
+    if(order.auction_type!=='offer'||!isLive(order)||!/(?:^|_)T?\d+_(?:RUNE|SOUL|RELIC)$/.test(order.item_type))continue;
+    const key=`${order.location_id}\u0000${order.item_type}`;
+    if(!index.has(key))index.set(key,[]);
+    index.get(key).push(order);
+  }
+  for(const rows of index.values())rows.sort((a,b)=>Number(a.unit_price)-Number(b.unit_price));
+  return index;
+}
+function materialPlanFor(source, targetEnchant, quantity, materialOffers) {
   const tier = Number(String(source.item_type).match(/^T(\d+)_/)?.[1]);
   const perItem = stonesPerEnchant(source.item_type);
   if (!tier || !perItem) return null;
@@ -183,8 +194,7 @@ function materialPlanFor(source, targetEnchant, quantity, orders) {
   for (let step=Number(source.enchantment); step<targetEnchant; step++) {
     const itemType = `T${tier}_${STONE_BY_STEP[step]}`;
     let needed = perItem * quantity;
-    const stock = orders.filter(o => o.location_id===source.location_id && o.auction_type==='offer' &&
-      o.item_type===itemType && isLive(o)).sort((a,b)=>Number(a.unit_price)-Number(b.unit_price));
+    const stock = materialOffers.get(`${source.location_id}\u0000${itemType}`)||[];
     const totalAvailable = stock.reduce((sum,o)=>sum+Number(o.amount),0);
     if (totalAvailable < needed) return null;
     for (const order of stock) {
@@ -197,7 +207,7 @@ function materialPlanFor(source, targetEnchant, quantity, orders) {
   }
   return { plan, totalCost };
 }
-function buildCandidate(buy, source, orders, tax) {
+function buildCandidate(buy, source, materialOffers, tax) {
   const targetEnchant=Number(buy.enchantment), sourceEnchant=Number(source.enchantment);
   if (!isLive(buy)||!isLive(source)||buy.location_id!=='3003'||buy.auction_type!=='request'||
       source.location_id==='3003'||source.auction_type!=='offer'||baseItemType(buy.item_type)!==baseItemType(source.item_type)||
@@ -212,7 +222,7 @@ function buildCandidate(buy, source, orders, tax) {
     const boundaries=[];
     for(let step=sourceEnchant;step<targetEnchant;step++){
       const itemType=`T${tier}_${STONE_BY_STEP[step]}`;
-      const stock=orders.filter(o=>o.location_id===source.location_id&&o.auction_type==='offer'&&o.item_type===itemType&&isLive(o)).sort((a,b)=>Number(a.unit_price)-Number(b.unit_price));
+      const stock=materialOffers.get(`${source.location_id}\u0000${itemType}`)||[];
       let available=0;for(const order of stock)available+=Number(order.amount);
       maxQuantity=Math.min(maxQuantity,Math.floor(available/perItem));
       let cumulative=0;for(const order of stock){cumulative+=Number(order.amount);for(const q of [Math.floor(cumulative/perItem),Math.floor(cumulative/perItem)+1])if(q>0&&q<=maxQuantity)boundaries.push(q)}
@@ -221,7 +231,7 @@ function buildCandidate(buy, source, orders, tax) {
   }else quantities.add(maxQuantity);
   if(maxQuantity<1)return null;
   let quantity=0,material=null,profit=0;
-  for(const q of quantities){const cost=upgrade?materialPlanFor(source,targetEnchant,q,orders):{plan:[],totalCost:0};if(!cost)continue;const net=Math.floor(q*Number(buy.unit_price)*(1-tax))-q*Number(source.unit_price)-cost.totalCost;if(net>profit){quantity=q;material=cost;profit=net}}
+  for(const q of quantities){const cost=upgrade?materialPlanFor(source,targetEnchant,q,materialOffers):{plan:[],totalCost:0};if(!cost)continue;const net=Math.floor(q*Number(buy.unit_price)*(1-tax))-q*Number(source.unit_price)-cost.totalCost;if(net>profit){quantity=q;material=cost;profit=net}}
   if(quantity<1||!material)return null;
   return {buyOrder:buy,sourceOrder:source,quantity:Number(buy.amount),matchedQuantity:quantity,
     taxRate:tax,estimatedProfitSilver:profit,unitProfitSilver:Math.floor(profit/quantity),
@@ -303,6 +313,7 @@ app.get('/api/item-names', async (req, res) => {
 app.get('/api/candidates', (req, res) => {
   const tax = reqTax(req.query.premium);
   const orders = db.prepare('SELECT * FROM orders').all().filter(isLive);
+  const materialOffers=indexMaterialOffers(orders);
   const bmBuys = orders.filter(o => o.location_id === '3003' && o.auction_type === 'request');
   const sourcesByItem = new Map();
   for (const source of orders) {
@@ -317,7 +328,7 @@ app.get('/api/candidates', (req, res) => {
   for (const buy of bmBuys) for (const source of (sourcesByItem.get(`${baseItemType(buy.item_type)}\u0000${Number(buy.quality)}`) || [])) {
     const key = `${buy.id}:${source.id}`;
     if (ignored.has(key)) continue;
-    const candidate=buildCandidate(buy,source,orders,tax);
+    const candidate=buildCandidate(buy,source,materialOffers,tax);
     if(candidate)matches.push(candidate);
   }
   res.json(matches.sort((a,b)=>b.estimatedProfitSilver-a.estimatedProfitSilver));
@@ -329,7 +340,7 @@ app.post('/api/flips', (req, res) => {
   const source = db.prepare('SELECT * FROM orders WHERE id=?').get(String(sourceOrderId));
   const tax = premium ? 0.04 : 0.08;
   const orders=db.prepare('SELECT * FROM orders').all().filter(isLive);
-  const candidate=buy&&source?buildCandidate(buy,source,orders,tax):null;
+  const candidate=buy&&source?buildCandidate(buy,source,indexMaterialOffers(orders),tax):null;
   if (!candidate) return res.status(400).json({ error: 'Orders are no longer a profitable direct or enchantment match in that city.' });
   const result = db.prepare("INSERT OR IGNORE INTO flips (buy_order_id,sell_order_id,tax_rate,status,created_at,max_quantity,material_plan) VALUES (?,?,?,'active',?,?,?)")
     .run(String(buyOrderId), String(sourceOrderId), tax, new Date().toISOString(), candidate.matchedQuantity, JSON.stringify(candidate.materialPlan));
