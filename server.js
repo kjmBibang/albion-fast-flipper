@@ -38,7 +38,7 @@ if (!scanColumns.has('last_ingest_ms')) db.exec('ALTER TABLE scan_status ADD COL
 const flipColumns = new Set(db.prepare('PRAGMA table_info(flips)').all().map(column => column.name));
 for (const [name, type] of [['spend_silver', 'INTEGER'], ['profit_silver', 'INTEGER'],
   ['max_quantity', 'INTEGER'],
-  ['quantity_completed', 'INTEGER'], ['outcome_at', 'TEXT'], ['archived', 'INTEGER NOT NULL DEFAULT 0']]) {
+  ['quantity_completed', 'INTEGER'], ['outcome_at', 'TEXT'], ['archived', 'INTEGER NOT NULL DEFAULT 0'], ['material_plan', 'TEXT']]) {
   if (!flipColumns.has(name)) db.exec(`ALTER TABLE flips ADD COLUMN ${name} ${type}`);
 }
 function clearStaleOrders() {
@@ -164,18 +164,104 @@ function sameItem(a, b) {
   return a.item_type === b.item_type && Number(a.quality) === Number(b.quality) &&
     Number(a.enchantment) === Number(b.enchantment);
 }
+function baseItemType(itemType) { return String(itemType).replace(/@[0-9]+$/, ''); }
+function stonesPerEnchant(itemType) {
+  itemType=baseItemType(itemType);
+  if (/^T\d+_2H_/.test(itemType)) return 384;
+  if (/^T\d+_MAIN_/.test(itemType)) return 288;
+  if (/^T\d+_(ARMOR_|BAG(?:_|$))/.test(itemType)) return 192;
+  if (/^T\d+_(HEAD_|SHOES_|CAPE|OFF_)/.test(itemType)) return 96;
+  return 0;
+}
+const STONE_BY_STEP = ['RUNE', 'SOUL', 'RELIC'];
+function materialPlanFor(source, targetEnchant, quantity, orders) {
+  const tier = Number(String(source.item_type).match(/^T(\d+)_/)?.[1]);
+  const perItem = stonesPerEnchant(source.item_type);
+  if (!tier || !perItem) return null;
+  const plan = [];
+  let totalCost = 0;
+  for (let step=Number(source.enchantment); step<targetEnchant; step++) {
+    const itemType = `T${tier}_${STONE_BY_STEP[step]}`;
+    let needed = perItem * quantity;
+    const stock = orders.filter(o => o.location_id===source.location_id && o.auction_type==='offer' &&
+      o.item_type===itemType && isLive(o)).sort((a,b)=>Number(a.unit_price)-Number(b.unit_price));
+    const totalAvailable = stock.reduce((sum,o)=>sum+Number(o.amount),0);
+    if (totalAvailable < needed) return null;
+    for (const order of stock) {
+      if (!needed) break;
+      const taken = Math.min(needed, Number(order.amount));
+      plan.push({ itemType, amount:taken, unitPrice:Number(order.unit_price) });
+      totalCost += taken * Number(order.unit_price);
+      needed -= taken;
+    }
+  }
+  return { plan, totalCost };
+}
+function buildCandidate(buy, source, orders, tax) {
+  const targetEnchant=Number(buy.enchantment), sourceEnchant=Number(source.enchantment);
+  if (!isLive(buy)||!isLive(source)||buy.location_id!=='3003'||buy.auction_type!=='request'||
+      source.location_id==='3003'||source.auction_type!=='offer'||baseItemType(buy.item_type)!==baseItemType(source.item_type)||
+      Number(buy.quality)!==Number(source.quality)||targetEnchant<sourceEnchant||
+      (targetEnchant>3&&targetEnchant!==sourceEnchant)) return null;
+  const upgrade=targetEnchant>sourceEnchant;
+  if (upgrade && !stonesPerEnchant(source.item_type)) return null;
+  let maxQuantity=Math.min(Number(buy.amount),Number(source.amount));
+  const tier=String(source.item_type).match(/^T(\d+)_/)?.[1]||'?';
+  const perItem=stonesPerEnchant(source.item_type), quantities=new Set();
+  if(upgrade){
+    const boundaries=[];
+    for(let step=sourceEnchant;step<targetEnchant;step++){
+      const itemType=`T${tier}_${STONE_BY_STEP[step]}`;
+      const stock=orders.filter(o=>o.location_id===source.location_id&&o.auction_type==='offer'&&o.item_type===itemType&&isLive(o)).sort((a,b)=>Number(a.unit_price)-Number(b.unit_price));
+      let available=0;for(const order of stock)available+=Number(order.amount);
+      maxQuantity=Math.min(maxQuantity,Math.floor(available/perItem));
+      let cumulative=0;for(const order of stock){cumulative+=Number(order.amount);for(const q of [Math.floor(cumulative/perItem),Math.floor(cumulative/perItem)+1])if(q>0&&q<=maxQuantity)boundaries.push(q)}
+    }
+    if(maxQuantity>0){quantities.add(1);quantities.add(maxQuantity);for(const q of boundaries)quantities.add(q)}
+  }else quantities.add(maxQuantity);
+  if(maxQuantity<1)return null;
+  let quantity=0,material=null,profit=0;
+  for(const q of quantities){const cost=upgrade?materialPlanFor(source,targetEnchant,q,orders):{plan:[],totalCost:0};if(!cost)continue;const net=Math.floor(q*Number(buy.unit_price)*(1-tax))-q*Number(source.unit_price)-cost.totalCost;if(net>profit){quantity=q;material=cost;profit=net}}
+  if(quantity<1||!material)return null;
+  return {buyOrder:buy,sourceOrder:source,quantity:Number(buy.amount),matchedQuantity:quantity,
+    taxRate:tax,estimatedProfitSilver:profit,unitProfitSilver:Math.floor(profit/quantity),
+    materialCostSilver:material.totalCost,materialPlan:material.plan,
+    routeLabel:upgrade?`${tier}.${sourceEnchant} → ${tier}.${targetEnchant}`:`Direct buy (${tier}.${targetEnchant})`,
+    buyAgeMs:Date.now()-Date.parse(buy.last_seen),sourceAgeMs:Date.now()-Date.parse(source.last_seen),
+    oldestAgeMs:Math.max(Date.now()-Date.parse(buy.last_seen),Date.now()-Date.parse(source.last_seen))};
+}
+function plannedMaterialCost(source, targetEnchant, plan, quantity) {
+  if (!plan?.length || Number(targetEnchant)<=Number(source.enchantment)) return 0;
+  const tier=Number(String(source.item_type).match(/^T(\d+)_/)?.[1]), perItem=stonesPerEnchant(source.item_type);
+  if(!tier||!perItem)return 0;
+  let cost=0;
+  for(let step=Number(source.enchantment);step<Number(targetEnchant);step++){
+    let needed=perItem*quantity, lastPrice=0;
+    for(const row of plan.filter(x=>x.itemType===`T${tier}_${STONE_BY_STEP[step]}`)){
+      lastPrice=Number(row.unitPrice);
+      const used=Math.min(needed,Number(row.amount));cost+=used*lastPrice;needed-=used;if(!needed)break;
+    }
+    if(needed&&lastPrice)cost+=needed*lastPrice;
+  }
+  return cost;
+}
 function presentFlip(f, orderMap, taxRate = f.tax_rate) {
   const buy = orderMap.get(f.buy_order_id);
   const source = orderMap.get(f.sell_order_id);
   const live = isLive(buy) && isLive(source);
-  const matchedQuantity = live ? Math.min(Number(buy.amount), Number(source.amount)) : 0;
+  const savedLimit=Number(f.max_quantity)||Infinity;
+  const matchedQuantity = f.quantity_completed ?? (live ? Math.min(savedLimit,Number(buy.amount),Number(source.amount)) : 0);
   const quantity = f.quantity_completed ?? (buy ? Number(buy.amount) : 0);
-  const cost = source ? (f.quantity_completed ?? matchedQuantity) * Number(source.unit_price) : 0;
-  const proceeds = buy ? (f.quantity_completed ?? matchedQuantity) * Number(buy.unit_price) : 0;
+  let materialPlan=[];try{materialPlan=JSON.parse(f.material_plan||'[]')}catch{}
+  const appliedQuantity=f.quantity_completed ?? matchedQuantity;
+  const materialCost=source?plannedMaterialCost(source,buy?.enchantment||0,materialPlan,appliedQuantity):0;
+  const cost = source ? appliedQuantity * Number(source.unit_price)+materialCost : 0;
+  const proceeds = buy ? appliedQuantity * Number(buy.unit_price) : 0;
   const profit = f.profit_silver ?? (Math.floor(proceeds * (1 - taxRate)) - cost);
   const ages = buy && source ? [Date.now() - Date.parse(buy.last_seen), Date.now() - Date.parse(source.last_seen)] : [];
   return { id:f.id, status:f.status, buyOrder:buy || null, sourceOrder:source || null, quantity, matchedQuantity,
-    taxRate, estimatedProfitSilver:profit, spendSilver:f.spend_silver ?? cost, outcomeAt:f.outcome_at,
+    taxRate, estimatedProfitSilver:profit, spendSilver:f.spend_silver ?? cost, materialCostSilver:materialCost,
+    routeLabel:source&&buy?(Number(source.enchantment)<Number(buy.enchantment)?`${String(source.item_type).match(/^T(\d+)_/)?.[1]}.${source.enchantment} → ${String(source.item_type).match(/^T(\d+)_/)?.[1]}.${buy.enchantment}`:`Direct buy (${String(source.item_type).match(/^T(\d+)_/)?.[1]}.${buy.enchantment})`):'Unavailable', outcomeAt:f.outcome_at,
     unitProfitSilver: quantity && buy && source ? Math.floor(Number(buy.unit_price)*(1-taxRate))-Number(source.unit_price) : 0,
     buyAgeMs:ages[0] || 0, sourceAgeMs:ages[1] || 0, oldestAgeMs:Math.max(...ages, 0), live };
 }
@@ -221,22 +307,18 @@ app.get('/api/candidates', (req, res) => {
   const sourcesByItem = new Map();
   for (const source of orders) {
     if (source.location_id === '3003' || source.auction_type !== 'offer') continue;
-    const item = itemKey(source);
+    const item = `${baseItemType(source.item_type)}\u0000${Number(source.quality)}`;
     if (!sourcesByItem.has(item)) sourcesByItem.set(item, []);
     sourcesByItem.get(item).push(source);
   }
   const ignored = new Set(db.prepare("SELECT buy_order_id, sell_order_id FROM flips WHERE status IN ('active','done','failed')").all()
     .map(x => `${x.buy_order_id}:${x.sell_order_id}`));
   const matches = [];
-  for (const buy of bmBuys) for (const source of (sourcesByItem.get(itemKey(buy)) || [])) {
+  for (const buy of bmBuys) for (const source of (sourcesByItem.get(`${baseItemType(buy.item_type)}\u0000${Number(buy.quality)}`) || [])) {
     const key = `${buy.id}:${source.id}`;
     if (ignored.has(key)) continue;
-    const quantity = Math.min(Number(buy.amount), Number(source.amount));
-    const profit = Math.floor(quantity * Number(buy.unit_price) * (1-tax)) - quantity * Number(source.unit_price);
-    if (quantity > 0 && profit > 0) matches.push({ buyOrder:buy, sourceOrder:source, quantity:Number(buy.amount), matchedQuantity:quantity,
-      taxRate:tax, estimatedProfitSilver:profit, unitProfitSilver:Math.floor(Number(buy.unit_price)*(1-tax))-Number(source.unit_price),
-      buyAgeMs:Date.now()-Date.parse(buy.last_seen), sourceAgeMs:Date.now()-Date.parse(source.last_seen),
-      oldestAgeMs:Math.max(Date.now()-Date.parse(buy.last_seen),Date.now()-Date.parse(source.last_seen)) });
+    const candidate=buildCandidate(buy,source,orders,tax);
+    if(candidate)matches.push(candidate);
   }
   res.json(matches.sort((a,b)=>b.estimatedProfitSilver-a.estimatedProfitSilver));
 });
@@ -245,15 +327,12 @@ app.post('/api/flips', (req, res) => {
   const { buyOrderId, sourceOrderId, premium = false } = req.body || {};
   const buy = db.prepare('SELECT * FROM orders WHERE id=?').get(String(buyOrderId));
   const source = db.prepare('SELECT * FROM orders WHERE id=?').get(String(sourceOrderId));
-  if (!isLive(buy) || !isLive(source) || buy.location_id !== '3003' || buy.auction_type !== 'request' ||
-      source.location_id === '3003' || source.auction_type !== 'offer' || !sameItem(buy, source))
-    return res.status(400).json({ error: 'Orders are no longer a valid exact match.' });
   const tax = premium ? 0.04 : 0.08;
-  const quantity = Math.min(Number(buy.amount), Number(source.amount));
-  const profit = Math.floor(quantity*Number(buy.unit_price)*(1-tax))-quantity*Number(source.unit_price);
-  if (profit <= 0) return res.status(400).json({ error: 'This match is no longer profitable at the selected tax rate.' });
-  const result = db.prepare("INSERT OR IGNORE INTO flips (buy_order_id,sell_order_id,tax_rate,status,created_at,max_quantity) VALUES (?,?,?,'active',?,?)")
-    .run(String(buyOrderId), String(sourceOrderId), tax, new Date().toISOString(), quantity);
+  const orders=db.prepare('SELECT * FROM orders').all().filter(isLive);
+  const candidate=buy&&source?buildCandidate(buy,source,orders,tax):null;
+  if (!candidate) return res.status(400).json({ error: 'Orders are no longer a profitable direct or enchantment match in that city.' });
+  const result = db.prepare("INSERT OR IGNORE INTO flips (buy_order_id,sell_order_id,tax_rate,status,created_at,max_quantity,material_plan) VALUES (?,?,?,'active',?,?,?)")
+    .run(String(buyOrderId), String(sourceOrderId), tax, new Date().toISOString(), candidate.matchedQuantity, JSON.stringify(candidate.materialPlan));
   res.status(result.changes ? 201 : 200).json({ id:Number(result.lastInsertRowid), saved:!!result.changes });
 });
 
@@ -271,7 +350,8 @@ app.patch('/api/flips/:id', (req, res) => {
   const quantity = req.body?.quantity == null ? maxQuantity : Number(req.body.quantity);
   if (!Number.isSafeInteger(quantity) || quantity < 1)
     return res.status(400).json({ error:'Enter a whole quantity greater than zero.' });
-  const spend = quantity * Number(source.unit_price);
+  let materialPlan=[];try{materialPlan=JSON.parse(flip.material_plan||'[]')}catch{}
+  const spend = quantity * Number(source.unit_price)+plannedMaterialCost(source,buy.enchantment,materialPlan,quantity);
   const targetSaleValue = quantity * Number(buy.unit_price);
   const saleTax = status === 'failed' ? 0.025 : flip.tax_rate;
   const saleValue = status === 'failed' ? Math.floor(targetSaleValue * 0.5) : targetSaleValue;
