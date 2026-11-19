@@ -1,3 +1,18 @@
 {
-  "ARMOR_CLOTH": "Robe"
+  "ARMOR_CLOTH": "Robe",
+  "2H_DAGGERPAIR": "Dagger Pair",
+  "2H_DIVINESTAFF": "Divine Staff",
+  "2H_FROSTSTAFF": "Great Frost Staff",
+  "2H_GLACIALSTAFF": "Glacial Staff",
+  "MAIN_AXE": "Battle Axe",
+  "MAIN_CURSEDSTAFF": "Cursed Staff",
+  "MAIN_ARCANESTAFF": "Arcane Staff",
+  "MAIN_1HCROSSBOW": "Light Crossbow",
+  "MAIN_DAGGER": "Dagger",
+  "MAIN_FIRESTAFF": "Fire Staff",
+  "MAIN_FROSTSTAFF": "Frost Staff",
+  "MAIN_HAMMER": "Hammer",
+  "MAIN_HOLYSTAFF": "Holy Staff",
+  "MAIN_MACE": "Mace",
+  "MAIN_RAPIER": "Bloodletter"
 }
