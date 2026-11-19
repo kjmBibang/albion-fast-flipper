@@ -137,6 +137,12 @@ app.get('/api/flips', (_req, res) => {
   res.json(flips.map(f => presentFlip(f, map, tax)));
 });
 
+app.get('/api/material-offers', (_req, res) => {
+  const orders = db.prepare('SELECT * FROM orders').all().filter(isLive);
+  res.json(orders.filter(o => o.auction_type === 'offer' && /^(?:T)?\d+_(?:RUNE|SOUL|RELIC)$/.test(o.item_type))
+    .map(o => ({ itemType:o.item_type, locationId:o.location_id, unitPrice:Number(o.unit_price), amount:Number(o.amount), lastSeen:o.last_seen })));
+});
+
 app.get('/api/performance', (_req, res) => {
   const summary = db.prepare(`SELECT COUNT(*) AS flip_count,
     COALESCE(SUM(spend_silver),0) AS total_spend_silver,
@@ -270,7 +276,7 @@ function presentFlip(f, orderMap, taxRate = f.tax_rate) {
   const profit = f.profit_silver ?? (Math.floor(proceeds * (1 - taxRate)) - cost);
   const ages = buy && source ? [Date.now() - Date.parse(buy.last_seen), Date.now() - Date.parse(source.last_seen)] : [];
   return { id:f.id, status:f.status, buyOrder:buy || null, sourceOrder:source || null, quantity, matchedQuantity,
-    taxRate, estimatedProfitSilver:profit, spendSilver:f.spend_silver ?? cost, materialCostSilver:materialCost,
+    taxRate, estimatedProfitSilver:profit, spendSilver:f.spend_silver ?? cost, materialCostSilver:materialCost, materialPlan,
     routeLabel:source&&buy?(Number(source.enchantment)<Number(buy.enchantment)?`${String(source.item_type).match(/^T(\d+)_/)?.[1]}.${source.enchantment} → ${String(source.item_type).match(/^T(\d+)_/)?.[1]}.${buy.enchantment}`:`Direct buy (${String(source.item_type).match(/^T(\d+)_/)?.[1]}.${buy.enchantment})`):'Unavailable', outcomeAt:f.outcome_at,
     unitProfitSilver: quantity && buy && source ? Math.floor(Number(buy.unit_price)*(1-taxRate))-Number(source.unit_price) : 0,
     buyAgeMs:ages[0] || 0, sourceAgeMs:ages[1] || 0, oldestAgeMs:Math.max(...ages, 0), live };
