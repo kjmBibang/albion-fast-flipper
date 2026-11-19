@@ -8,6 +8,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const HOST = '127.0.0.1';
 const STALE_ORDER_MS = 30 * 60 * 1000;
 const SAMPLES_DIR = path.join(__dirname, 'samples');
+const ITEM_TERMS_FILE = path.join(__dirname, 'item-terms.json');
 const db = new DatabaseSync(path.join(__dirname, 'albion-flipper.sqlite'));
 fs.mkdirSync(SAMPLES_DIR, { recursive: true });
 
@@ -319,6 +320,29 @@ app.get('/api/item-names', async (req, res) => {
 app.get('/api/item-catalog', (_req, res) => {
   const rows = db.prepare('SELECT item_type, COUNT(*) AS order_count FROM orders GROUP BY item_type ORDER BY item_type').all();
   res.json(rows.map(row => ({ itemType:row.item_type, orderCount:Number(row.order_count) })));
+});
+
+function readItemTerms() {
+  try { return JSON.parse(fs.readFileSync(ITEM_TERMS_FILE, 'utf8')); }
+  catch (err) { if (err.code === 'ENOENT') return {}; throw err; }
+}
+app.get('/api/item-terms', (_req, res) => {
+  try { res.json(readItemTerms()); }
+  catch (err) { console.error('Could not read item term dictionary:', err.message); res.status(500).json({ error:'Could not read the item term dictionary.' }); }
+});
+app.put('/api/item-terms', (req, res) => {
+  const key = String(req.body?.key || ''), term = String(req.body?.term || '').trim();
+  if (!/^[A-Z0-9_|]+$/.test(key) || key.length > 100 || term.length > 100)
+    return res.status(400).json({ error:'Term key or value is invalid.' });
+  try {
+    const terms = readItemTerms();
+    if (term) terms[key] = term; else delete terms[key];
+    fs.writeFileSync(ITEM_TERMS_FILE, JSON.stringify(terms, null, 2) + '\n', 'utf8');
+    res.json({ saved:true, terms });
+  } catch (err) {
+    console.error('Could not save item term dictionary:', err.message);
+    res.status(500).json({ error:'Could not save the item term dictionary.' });
+  }
 });
 
 app.get('/api/candidates', (req, res) => {
