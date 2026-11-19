@@ -1,0 +1,3 @@
+(node:22144) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+Could not start server at http://127.0.0.1:3000: listen EADDRINUSE: address already in use 127.0.0.1:3000

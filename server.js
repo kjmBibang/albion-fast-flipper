@@ -316,6 +316,11 @@ app.get('/api/item-names', async (req, res) => {
   res.json(names);
 });
 
+app.get('/api/item-catalog', (_req, res) => {
+  const rows = db.prepare('SELECT item_type, COUNT(*) AS order_count FROM orders GROUP BY item_type ORDER BY item_type').all();
+  res.json(rows.map(row => ({ itemType:row.item_type, orderCount:Number(row.order_count) })));
+});
+
 app.get('/api/candidates', (req, res) => {
   const tax = reqTax(req.query.premium);
   const orders = db.prepare('SELECT * FROM orders').all().filter(isLive);
