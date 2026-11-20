@@ -100,6 +100,23 @@ app.post('/marketorders.ingest', (req, res) => {
   let accepted = 0;
   db.exec('BEGIN');
   try {
+    // A new market response is the current snapshot for each stone listing it
+    // contains. Remove older offers for those city/item pairs first, otherwise
+    // listings that disappeared from the market remain counted as available.
+    const scannedStoneGroups = new Map();
+    for (const o of incoming) {
+      if (o.Id == null || !o.ItemTypeId || !o.LocationId || o.AuctionType !== 'offer' ||
+          !/(?:^|_)T?\d+_(?:RUNE|SOUL|RELIC)$/.test(o.ItemTypeId)) continue;
+      const key = `${String(o.LocationId)}\u0000${o.ItemTypeId}`;
+      if (!scannedStoneGroups.has(key)) scannedStoneGroups.set(key, []);
+      scannedStoneGroups.get(key).push(String(o.Id));
+    }
+    for (const [key, ids] of scannedStoneGroups) {
+      const [locationId, itemType] = key.split('\u0000');
+      const placeholders = ids.map(() => '?').join(',');
+      db.prepare(`DELETE FROM orders WHERE location_id=? AND item_type=? AND auction_type='offer' AND id NOT IN (${placeholders})`)
+        .run(locationId, itemType, ...ids);
+    }
     for (const o of incoming) {
       if (o.Id == null || !o.ItemTypeId || !o.LocationId) continue;
       upsertOrder.run(String(o.Id), o.ItemTypeId, String(o.LocationId), Number(o.QualityLevel || 1),
