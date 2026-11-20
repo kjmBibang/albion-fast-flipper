@@ -14,5 +14,17 @@
   "MAIN_HAMMER": "Hammer",
   "MAIN_HOLYSTAFF": "Holy Staff",
   "MAIN_MACE": "Mace",
-  "MAIN_RAPIER": "Bloodletter"
+  "MAIN_RAPIER": "Bloodletter",
+  "2H_BOW": "Bow",
+  "2H_CLAWPAIR": "Claws",
+  "2H_CROSSBOW": "Crossbow",
+  "2H_CURSEDSTAFF": "Great Cursed Staff",
+  "2H_DAGGER_KATAR": "Bridled Fury",
+  "2H_DEMONICSTAFF": "Demonic Staff",
+  "2H_DOUBLEBLADEDSTAFF": "Double Bladed Staff",
+  "2H_DUALSWORD": "Dual Swords",
+  "2H_ENIGMATICSTAFF": "Enigmatic Staff",
+  "2H_HALBERD": "Halberd",
+  "ARMOR_LEATHER": "Jacket",
+  "BAG_INSIGHT": "Satchel of Insight"
 }
